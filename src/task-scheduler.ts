@@ -1,8 +1,10 @@
-import { ChildProcess } from 'child_process';
+import { ChildProcess, execFile } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
+import path from 'path';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { readEnvFile } from './env.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -75,6 +77,67 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+interface ScriptResult {
+  wakeAgent: boolean;
+  data?: unknown;
+}
+
+const SCRIPT_TIMEOUT_MS = 30_000;
+const PROJECT_ROOT = process.cwd();
+
+/**
+ * Run a task's pre-check script on the host before spawning a container.
+ * Credentials are read from .env and injected into the subprocess environment —
+ * they are never passed into the container.
+ * Returns null if the script errors or produces no output (conservative: skip agent).
+ */
+async function runScriptOnHost(scriptFile: string): Promise<ScriptResult | null> {
+  const scriptPath = path.resolve(PROJECT_ROOT, scriptFile);
+
+  const jiraEnv = readEnvFile(['JIRA_BASE_URL', 'JIRA_USERNAME', 'JIRA_API_TOKEN']);
+
+  return new Promise((resolve) => {
+    execFile(
+      'bash',
+      [scriptPath],
+      {
+        timeout: SCRIPT_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        env: {
+          ...process.env,
+          ...jiraEnv,
+        },
+      },
+      (error, stdout, stderr) => {
+        if (stderr) {
+          logger.debug({ scriptFile, stderr: stderr.slice(0, 500) }, 'Script stderr');
+        }
+        if (error) {
+          logger.error({ scriptFile, error: error.message }, 'Pre-check script error');
+          return resolve(null);
+        }
+        const lines = stdout.trim().split('\n');
+        const lastLine = lines[lines.length - 1];
+        if (!lastLine) {
+          logger.warn({ scriptFile }, 'Pre-check script produced no output');
+          return resolve(null);
+        }
+        try {
+          const result = JSON.parse(lastLine);
+          if (typeof result.wakeAgent !== 'boolean') {
+            logger.warn({ scriptFile, lastLine }, 'Pre-check script output missing wakeAgent boolean');
+            return resolve(null);
+          }
+          resolve(result as ScriptResult);
+        } catch {
+          logger.warn({ scriptFile, lastLine }, 'Pre-check script output is not valid JSON');
+          resolve(null);
+        }
+      },
+    );
+  });
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
@@ -139,13 +202,30 @@ async function runTask(
       id: t.id,
       groupFolder: t.group_folder,
       prompt: t.prompt,
-      script: t.script,
+      script_file: t.script_file,
       schedule_type: t.schedule_type,
       schedule_value: t.schedule_value,
       status: t.status,
       next_run: t.next_run,
     })),
   );
+
+  // Host-side pre-check: run script before spawning the container.
+  // Credentials are injected here on the host — they never enter the container.
+  let agentPrompt = task.prompt;
+  if (task.script_file) {
+    logger.info({ taskId: task.id, scriptFile: task.script_file }, 'Running pre-check script on host');
+    const scriptResult = await runScriptOnHost(task.script_file);
+    if (!scriptResult || !scriptResult.wakeAgent) {
+      const reason = scriptResult ? 'wakeAgent=false' : 'script error/no output';
+      logger.info({ taskId: task.id, reason }, 'Pre-check skipped agent wake');
+      const nextRun = computeNextRun(task);
+      updateTaskAfterRun(task.id, nextRun, 'Skipped: no new issues');
+      return;
+    }
+    logger.info({ taskId: task.id }, 'Pre-check wakeAgent=true, enriching prompt');
+    agentPrompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${task.prompt}`;
+  }
 
   let result: string | null = null;
   let error: string | null = null;
@@ -173,14 +253,13 @@ async function runTask(
     const output = await runContainerAgent(
       group,
       {
-        prompt: task.prompt,
+        prompt: agentPrompt,
         sessionId,
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
-        script: task.script || undefined,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

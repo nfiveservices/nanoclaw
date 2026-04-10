@@ -1,6 +1,25 @@
 import fs from 'fs';
 import path from 'path';
 
+const PROJECT_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const TRUSTED_SCRIPT_DIR = path.join(PROJECT_ROOT, 'scripts', 'task-scripts');
+
+/**
+ * Validate that a script_file path resolves within the trusted host-only
+ * directory (scripts/task-scripts/). Containers cannot write to this directory,
+ * so accepting only paths within it prevents container-to-host script injection.
+ */
+function validateScriptFile(scriptFile: string): string | null {
+  const resolved = path.resolve(PROJECT_ROOT, scriptFile);
+  if (!resolved.startsWith(TRUSTED_SCRIPT_DIR + path.sep) && resolved !== TRUSTED_SCRIPT_DIR) {
+    return null;
+  }
+  if (!fs.existsSync(resolved)) {
+    return null;
+  }
+  return resolved;
+}
+
 import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
@@ -162,7 +181,7 @@ export async function processTaskIpc(
     schedule_type?: string;
     schedule_value?: string;
     context_mode?: string;
-    script?: string;
+    script_file?: string;
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
@@ -256,12 +275,27 @@ export async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
+        // Validate script_file if provided — must resolve within scripts/task-scripts/
+        let resolvedScriptFile: string | null = null;
+        if (data.script_file) {
+          resolvedScriptFile = validateScriptFile(data.script_file);
+          if (!resolvedScriptFile) {
+            logger.warn(
+              { sourceGroup, scriptFile: data.script_file },
+              'schedule_task rejected: script_file outside trusted directory or not found',
+            );
+            break;
+          }
+          // Store the canonical relative path so the scheduler can find it portably
+          resolvedScriptFile = path.relative(PROJECT_ROOT, resolvedScriptFile);
+        }
+
         createTask({
           id: taskId,
           group_folder: targetFolder,
           chat_jid: targetJid,
           prompt: data.prompt,
-          script: data.script || null,
+          script_file: resolvedScriptFile,
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
           context_mode: contextMode,
@@ -354,7 +388,6 @@ export async function processTaskIpc(
 
         const updates: Parameters<typeof updateTask>[1] = {};
         if (data.prompt !== undefined) updates.prompt = data.prompt;
-        if (data.script !== undefined) updates.script = data.script || null;
         if (data.schedule_type !== undefined)
           updates.schedule_type = data.schedule_type as
             | 'cron'

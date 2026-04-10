@@ -28,6 +28,10 @@ export interface SlackChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+const HEALTH_CHECK_INTERVAL = 60_000; // 1 minute
+const BASE_RECONNECT_DELAY = 5_000; // 5 seconds
+const MAX_RECONNECT_DELAY = 5 * 60_000; // 5 minutes
+
 export class SlackChannel implements Channel {
   name = 'slack';
 
@@ -37,6 +41,11 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+
+  private reconnectAttempts = 0;
+  private reconnecting = false;
+  private healthCheckTimer: ReturnType<typeof setInterval> | undefined;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   private opts: SlackChannelOpts;
 
@@ -94,8 +103,7 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
@@ -113,7 +121,10 @@ export class SlackChannel implements Channel {
       let content = msg.text;
       if (this.botUserId && !isBotMessage) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
       }
@@ -142,13 +153,21 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
+
+    // Surface Bolt errors (e.g. WebSocket failures after network loss) so we
+    // can detect dead connections and reconnect rather than silently hanging.
+    this.app.error(async (err) => {
+      logger.warn({ err }, 'Slack: app error');
+      if (this.connected) this.scheduleReconnect();
+    });
+
+    // Periodic health check: catches zombie connections that Bolt doesn't
+    // self-heal after a WiFi drop/rejoin (auth.test() fails on a dead socket).
+    this.startHealthCheck();
 
     // Flush any messages queued before connection
     await this.flushOutgoingQueue();
@@ -200,6 +219,8 @@ export class SlackChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    clearInterval(this.healthCheckTimer);
+    clearTimeout(this.reconnectTimer);
     this.connected = false;
     await this.app.stop();
   }
@@ -245,9 +266,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);
@@ -261,6 +280,59 @@ export class SlackChannel implements Channel {
     } catch (err) {
       logger.debug({ userId, err }, 'Failed to resolve Slack user name');
       return undefined;
+    }
+  }
+
+  private startHealthCheck(): void {
+    this.healthCheckTimer = setInterval(async () => {
+      if (!this.connected || this.reconnecting) return;
+      try {
+        await this.app.client.auth.test();
+      } catch (err) {
+        logger.warn({ err }, 'Slack: health check failed, scheduling reconnect');
+        this.scheduleReconnect();
+      }
+    }, HEALTH_CHECK_INTERVAL);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    this.connected = false;
+
+    const delay = Math.min(
+      BASE_RECONNECT_DELAY * Math.pow(2, this.reconnectAttempts),
+      MAX_RECONNECT_DELAY,
+    );
+    this.reconnectAttempts++;
+
+    logger.info(
+      { delay, attempt: this.reconnectAttempts },
+      'Slack: scheduling reconnect',
+    );
+
+    this.reconnectTimer = setTimeout(() => void this.doReconnect(), delay);
+  }
+
+  private async doReconnect(): Promise<void> {
+    logger.info({ attempt: this.reconnectAttempts }, 'Slack: attempting reconnect');
+    try {
+      await this.app.stop().catch(() => {});
+      await this.app.start();
+
+      const auth = await this.app.client.auth.test();
+      this.botUserId = auth.user_id as string;
+
+      this.connected = true;
+      this.reconnecting = false;
+      this.reconnectAttempts = 0;
+
+      logger.info({ botUserId: this.botUserId }, 'Slack: reconnected successfully');
+      await this.flushOutgoingQueue();
+    } catch (err) {
+      logger.warn({ err, attempt: this.reconnectAttempts }, 'Slack: reconnect failed');
+      this.reconnecting = false;
+      this.scheduleReconnect();
     }
   }
 

@@ -68,6 +68,11 @@ vi.mock('@slack/bolt', () => ({
       this.eventHandlers.set(name, handler);
     }
 
+    errorHandler: Handler | null = null;
+    error(handler: Handler) {
+      this.errorHandler = handler;
+    }
+
     async start() {}
     async stop() {}
   },
@@ -132,7 +137,9 @@ function currentApp() {
   return appRef.current;
 }
 
-async function triggerMessageEvent(event: ReturnType<typeof createMessageEvent>) {
+async function triggerMessageEvent(
+  event: ReturnType<typeof createMessageEvent>,
+) {
   const handler = currentApp().eventHandlers.get('message');
   if (handler) await handler({ event });
 }
@@ -192,6 +199,166 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
 
       expect(channel.isConnected()).toBe(false);
+    });
+
+    it('registers app.error handler on connect', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+
+      await channel.connect();
+
+      expect(currentApp().errorHandler).toBeTypeOf('function');
+    });
+
+    it('clears timers on disconnect', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+
+      await channel.connect();
+      await channel.disconnect();
+
+      // Advancing time should not cause any unhandled timer activity
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+    });
+  });
+
+  // --- Reconnection ---
+
+  describe('reconnection', () => {
+    it('schedules reconnect when app.error fires while connected', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      expect(channel.isConnected()).toBe(true);
+
+      // Simulate Bolt surfacing a WebSocket error
+      await currentApp().errorHandler!(new Error('WebSocket closed'));
+
+      expect(channel.isConnected()).toBe(false);
+
+      vi.useRealTimers();
+    });
+
+    it('reconnects successfully after failure', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await currentApp().errorHandler!(new Error('connection dropped'));
+      expect(channel.isConnected()).toBe(false);
+
+      // Advance past the initial 5s backoff delay
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(channel.isConnected()).toBe(true);
+      vi.useRealTimers();
+    });
+
+    it('flushes queued messages after reconnect', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Trigger disconnect
+      await currentApp().errorHandler!(new Error('connection dropped'));
+      // Queue a message while disconnected
+      await channel.sendMessage('slack:C0123456789', 'queued after drop');
+
+      expect(currentApp().client.chat.postMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'queued after drop' }),
+      );
+
+      await vi.advanceTimersByTimeAsync(6000);
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ text: 'queued after drop' }),
+      );
+      vi.useRealTimers();
+    });
+
+    it('uses exponential backoff for repeated failures', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Make start() fail twice so reconnect retries
+      const app = currentApp();
+      const originalStart = app.start.bind(app);
+      app.start = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('start failed'))
+        .mockRejectedValueOnce(new Error('start failed'))
+        .mockImplementation(originalStart);
+
+      await currentApp().errorHandler!(new Error('connection dropped'));
+
+      // First attempt: 5s delay (2^0 * 5000)
+      await vi.advanceTimersByTimeAsync(5500);
+      expect(channel.isConnected()).toBe(false); // first attempt failed
+
+      // Second attempt: 10s delay (2^1 * 5000)
+      await vi.advanceTimersByTimeAsync(10500);
+      expect(channel.isConnected()).toBe(false); // second attempt failed
+
+      // Third attempt: 20s delay (2^2 * 5000)
+      await vi.advanceTimersByTimeAsync(20500);
+      expect(channel.isConnected()).toBe(true); // third attempt succeeded
+
+      vi.useRealTimers();
+    });
+
+    it('health check triggers reconnect when auth.test fails', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Make the next auth.test() fail (simulates zombie connection)
+      currentApp().client.auth.test.mockRejectedValueOnce(
+        new Error('socket dead'),
+      );
+
+      // Advance past the 60s health check interval
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      expect(channel.isConnected()).toBe(false); // health check marked disconnected
+
+      // Let reconnect fire
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(channel.isConnected()).toBe(true);
+
+      vi.useRealTimers();
+    });
+
+    it('health check does not trigger a second reconnect while already reconnecting', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Spy on start() to count actual reconnect attempts
+      const startSpy = vi.spyOn(currentApp(), 'start');
+
+      // Trigger reconnect via error handler; reconnect timer is set (5s backoff)
+      await currentApp().errorHandler!(new Error('drop'));
+
+      // Advance past health check interval (60s) WITHOUT letting the 5s reconnect fire first
+      // The health check should skip because this.reconnecting === true
+      // Then advance the remaining time to let the reconnect complete
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      // Only one reconnect attempt should have fired (from the 5s timer, not health check)
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(channel.isConnected()).toBe(true);
+
+      vi.useRealTimers();
     });
   });
 
@@ -309,7 +476,10 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      const event = createMessageEvent({ user: 'U_BOT_123', text: 'Self message' });
+      const event = createMessageEvent({
+        user: 'U_BOT_123',
+        text: 'Self message',
+      });
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -391,13 +561,17 @@ describe('SlackChannel', () => {
       await channel.connect();
 
       // First message — API call
-      await triggerMessageEvent(createMessageEvent({ user: 'U_USER_456', text: 'First' }));
+      await triggerMessageEvent(
+        createMessageEvent({ user: 'U_USER_456', text: 'First' }),
+      );
       // Second message — should use cache
-      await triggerMessageEvent(createMessageEvent({
-        user: 'U_USER_456',
-        text: 'Second',
-        ts: '1704067201.000000',
-      }));
+      await triggerMessageEvent(
+        createMessageEvent({
+          user: 'U_USER_456',
+          text: 'Second',
+          ts: '1704067201.000000',
+        }),
+      );
 
       expect(currentApp().client.users.info).toHaveBeenCalledTimes(1);
     });
@@ -407,7 +581,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      currentApp().client.users.info.mockRejectedValueOnce(new Error('API error'));
+      currentApp().client.users.info.mockRejectedValueOnce(
+        new Error('API error'),
+      );
 
       const event = createMessageEvent({ user: 'U_UNKNOWN', text: 'Hi' });
       await triggerMessageEvent(event);
@@ -812,17 +988,13 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
 
       // First page returns a cursor; second page returns no cursor
-      currentApp().client.conversations.list
-        .mockResolvedValueOnce({
-          channels: [
-            { id: 'C001', name: 'general', is_member: true },
-          ],
+      currentApp()
+        .client.conversations.list.mockResolvedValueOnce({
+          channels: [{ id: 'C001', name: 'general', is_member: true }],
           response_metadata: { next_cursor: 'cursor_page2' },
         })
         .mockResolvedValueOnce({
-          channels: [
-            { id: 'C002', name: 'random', is_member: true },
-          ],
+          channels: [{ id: 'C002', name: 'random', is_member: true }],
           response_metadata: {},
         });
 
@@ -830,7 +1002,8 @@ describe('SlackChannel', () => {
 
       // Should have called conversations.list twice (once per page)
       expect(currentApp().client.conversations.list).toHaveBeenCalledTimes(2);
-      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(2,
+      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({ cursor: 'cursor_page2' }),
       );
 

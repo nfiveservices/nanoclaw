@@ -53,12 +53,12 @@ vi.mock('./mount-security.js', () => ({
 
 // Mock container-runtime
 vi.mock('./container-runtime.js', () => ({
+  CONTAINER_HOST_GATEWAY: 'host.docker.internal',
   CONTAINER_RUNTIME_BIN: 'docker',
   hostGatewayArgs: () => [],
   readonlyMountArgs: (h: string, c: string) => ['-v', `${h}:${c}:ro`],
   stopContainer: vi.fn(),
 }));
-
 
 // Create a controllable fake ChildProcess
 function createFakeProcess() {

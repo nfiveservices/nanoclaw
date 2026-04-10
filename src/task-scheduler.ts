@@ -91,10 +91,16 @@ const PROJECT_ROOT = process.cwd();
  * they are never passed into the container.
  * Returns null if the script errors or produces no output (conservative: skip agent).
  */
-async function runScriptOnHost(scriptFile: string): Promise<ScriptResult | null> {
+async function runScriptOnHost(
+  scriptFile: string,
+): Promise<ScriptResult | null> {
   const scriptPath = path.resolve(PROJECT_ROOT, scriptFile);
 
-  const jiraEnv = readEnvFile(['JIRA_BASE_URL', 'JIRA_USERNAME', 'JIRA_API_TOKEN']);
+  const jiraEnv = readEnvFile([
+    'JIRA_BASE_URL',
+    'JIRA_USERNAME',
+    'JIRA_API_TOKEN',
+  ]);
 
   return new Promise((resolve) => {
     execFile(
@@ -110,10 +116,16 @@ async function runScriptOnHost(scriptFile: string): Promise<ScriptResult | null>
       },
       (error, stdout, stderr) => {
         if (stderr) {
-          logger.debug({ scriptFile, stderr: stderr.slice(0, 500) }, 'Script stderr');
+          logger.debug(
+            { scriptFile, stderr: stderr.slice(0, 500) },
+            'Script stderr',
+          );
         }
         if (error) {
-          logger.error({ scriptFile, error: error.message }, 'Pre-check script error');
+          logger.error(
+            { scriptFile, error: error.message },
+            'Pre-check script error',
+          );
           return resolve(null);
         }
         const lines = stdout.trim().split('\n');
@@ -125,12 +137,18 @@ async function runScriptOnHost(scriptFile: string): Promise<ScriptResult | null>
         try {
           const result = JSON.parse(lastLine);
           if (typeof result.wakeAgent !== 'boolean') {
-            logger.warn({ scriptFile, lastLine }, 'Pre-check script output missing wakeAgent boolean');
+            logger.warn(
+              { scriptFile, lastLine },
+              'Pre-check script output missing wakeAgent boolean',
+            );
             return resolve(null);
           }
           resolve(result as ScriptResult);
         } catch {
-          logger.warn({ scriptFile, lastLine }, 'Pre-check script output is not valid JSON');
+          logger.warn(
+            { scriptFile, lastLine },
+            'Pre-check script output is not valid JSON',
+          );
           resolve(null);
         }
       },
@@ -214,16 +232,24 @@ async function runTask(
   // Credentials are injected here on the host — they never enter the container.
   let agentPrompt = task.prompt;
   if (task.script_file) {
-    logger.info({ taskId: task.id, scriptFile: task.script_file }, 'Running pre-check script on host');
+    logger.info(
+      { taskId: task.id, scriptFile: task.script_file },
+      'Running pre-check script on host',
+    );
     const scriptResult = await runScriptOnHost(task.script_file);
     if (!scriptResult || !scriptResult.wakeAgent) {
-      const reason = scriptResult ? 'wakeAgent=false' : 'script error/no output';
+      const reason = scriptResult
+        ? 'wakeAgent=false'
+        : 'script error/no output';
       logger.info({ taskId: task.id, reason }, 'Pre-check skipped agent wake');
       const nextRun = computeNextRun(task);
       updateTaskAfterRun(task.id, nextRun, 'Skipped: no new issues');
       return;
     }
-    logger.info({ taskId: task.id }, 'Pre-check wakeAgent=true, enriching prompt');
+    logger.info(
+      { taskId: task.id },
+      'Pre-check wakeAgent=true, enriching prompt',
+    );
     agentPrompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${task.prompt}`;
   }
 

@@ -1,7 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 
-const PROJECT_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const PROJECT_ROOT = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  '..',
+);
 const TRUSTED_SCRIPT_DIR = path.join(PROJECT_ROOT, 'scripts', 'task-scripts');
 
 /**
@@ -11,7 +14,10 @@ const TRUSTED_SCRIPT_DIR = path.join(PROJECT_ROOT, 'scripts', 'task-scripts');
  */
 function validateScriptFile(scriptFile: string): string | null {
   const resolved = path.resolve(PROJECT_ROOT, scriptFile);
-  if (!resolved.startsWith(TRUSTED_SCRIPT_DIR + path.sep) && resolved !== TRUSTED_SCRIPT_DIR) {
+  if (
+    !resolved.startsWith(TRUSTED_SCRIPT_DIR + path.sep) &&
+    resolved !== TRUSTED_SCRIPT_DIR
+  ) {
     return null;
   }
   if (!fs.existsSync(resolved)) {

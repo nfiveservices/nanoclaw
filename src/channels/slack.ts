@@ -289,7 +289,10 @@ export class SlackChannel implements Channel {
       try {
         await this.app.client.auth.test();
       } catch (err) {
-        logger.warn({ err }, 'Slack: health check failed, scheduling reconnect');
+        logger.warn(
+          { err },
+          'Slack: health check failed, scheduling reconnect',
+        );
         this.scheduleReconnect();
       }
     }, HEALTH_CHECK_INTERVAL);
@@ -315,7 +318,10 @@ export class SlackChannel implements Channel {
   }
 
   private async doReconnect(): Promise<void> {
-    logger.info({ attempt: this.reconnectAttempts }, 'Slack: attempting reconnect');
+    logger.info(
+      { attempt: this.reconnectAttempts },
+      'Slack: attempting reconnect',
+    );
     try {
       await this.app.stop().catch(() => {});
       await this.app.start();
@@ -327,10 +333,16 @@ export class SlackChannel implements Channel {
       this.reconnecting = false;
       this.reconnectAttempts = 0;
 
-      logger.info({ botUserId: this.botUserId }, 'Slack: reconnected successfully');
+      logger.info(
+        { botUserId: this.botUserId },
+        'Slack: reconnected successfully',
+      );
       await this.flushOutgoingQueue();
     } catch (err) {
-      logger.warn({ err, attempt: this.reconnectAttempts }, 'Slack: reconnect failed');
+      logger.warn(
+        { err, attempt: this.reconnectAttempts },
+        'Slack: reconnect failed',
+      );
       this.reconnecting = false;
       this.scheduleReconnect();
     }
